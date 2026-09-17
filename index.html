@@ -325,7 +325,7 @@
       </div>
       <div class="speaker-col">
         <div>
-          <div class="speaker-meta">ON STAGE</div>
+          <div class="speaker-meta">PRESENTING</div>
           <div id="speaker-name" class="empty">Queue is empty</div>
         </div>
         
@@ -352,7 +352,7 @@
   <section class="admin-panel" data-admin-only>
     <form id="add-form" class="form-row">
       <input id="in-name" type="text" placeholder="Presenter Name" required autocomplete="off">
-      <input id="in-email" type="email" placeholder="Email (notifies on-deck)" autocomplete="off">
+      <input id="in-email" type="email" placeholder="Email" autocomplete="off">
       <button type="submit">Enqueue</button>
     </form>
   </section>
@@ -367,7 +367,7 @@
   let timer = { duration_seconds: 180, remaining_seconds: 180, running: false, ends_at: null };
   let currentUser = null;
 
-  // DOM elements
+  // DOM Elements
   const clockEl = document.getElementById('clock');
   const speakerNameEl = document.getElementById('speaker-name');
   const queueRowsEl = document.getElementById('queue-rows');
@@ -385,6 +385,65 @@
     return `${m}:${rem}`;
   }
 
+  // --- Clock Handler (Pause/Resume Supported) ---
+  function renderClock() {
+    let curSec = timer.remaining_seconds ?? 180;
+
+    if (timer.running && timer.ends_at) {
+      const endsAtTime = new Date(timer.ends_at).getTime();
+      const diff = Math.round((endsAtTime - Date.now()) / 1000);
+      curSec = Math.max(0, diff);
+    }
+
+    clockEl.textContent = fmt(curSec);
+    clockEl.classList.toggle('warn', curSec <= 30 && curSec > 0);
+    playPauseBtn.textContent = timer.running ? '❚❚' : '▷';
+
+    if (timer.running && curSec === 0) {
+      handleAdvanceQueue();
+    }
+  }
+
+  // --- Notification Checker ---
+  async function checkAndNotifyUpcoming() {
+    // Query positions 2 through 5 (0-indexed range 1 to 4)
+    const { data: upcoming, error } = await sb
+      .from('queue')
+      .select('*')
+      .order('position', { ascending: true })
+      .range(1, 4);
+
+    if (error || !upcoming) return;
+
+    for (const [index, person] of upcoming.entries()) {
+      const slotNumber = index + 2;
+
+      // Notify if they have an email AND haven't been notified for this specific position yet
+      if (person.notify_email && person.last_notified_position !== slotNumber) {
+        console.log(`Sending alert for position #${slotNumber} to: ${person.name} (${person.notify_email})`);
+
+        const { error: fnError } = await sb.functions.invoke('send-queue-alert', {
+          body: {
+            to: person.notify_email,
+            name: person.name,
+            position: slotNumber
+          }
+        });
+
+        if (!fnError) {
+          // Update the last notified position in database
+          await sb
+            .from('queue')
+            .update({ last_notified_position: slotNumber, notified: true })
+            .eq('id', person.id);
+        } else {
+          console.error("Failed to send notification email:", fnError);
+        }
+      }
+    }
+  }
+
+  // --- Render Queue UI ---
   function renderQueue() {
     queueRowsEl.innerHTML = '';
     queueCountEl.textContent = `${queue.length} PRESENTER${queue.length === 1 ? '' : 'S'}`;
@@ -403,7 +462,7 @@
       const row = document.createElement('div');
       row.className = 'q-row' + (idx === 0 ? ' active-speaker' : '');
 
-      const tagText = idx === 0 ? 'ON STAGE' : idx === 1 ? 'ON DECK (NOTIFIED)' : '';
+      const tagText = idx === 0 ? 'PRESENTING' : 'IN QUEUE';
       const tagClass = idx === 0 ? 'q-sub on-stage' : (idx === 1 ? 'q-sub on-deck' : 'q-sub');
 
       row.innerHTML = `
@@ -426,38 +485,28 @@
     }
   }
 
-  function renderClock() {
-    let curSec = timer.remaining_seconds;
-    if (timer.running && timer.ends_at) {
-      const diff = Math.round((new Date(timer.ends_at).getTime() - Date.now()) / 1000);
-      curSec = Math.max(0, diff);
-    }
-    clockEl.textContent = fmt(curSec);
-    clockEl.classList.toggle('warn', curSec <= 30 && curSec > 0);
-    playPauseBtn.textContent = timer.running ? '❚❚' : '▷';
-
-    if (timer.running && curSec === 0) {
-      sb.rpc('advance_queue');
-    }
-  }
-
-  // --- Realtime & DB Sync ---
+  // --- Data Sync ---
   async function loadInitialData() {
     const { data: q } = await sb.from('queue').select('*').order('position', { ascending: true });
     if (q) queue = q;
 
-    const { data: t } = await sb.from('timer_state').select('*').eq('id', 1).single();
+    const { data: t } = await sb.from('timer_state').select('*').eq('id', 1).maybeSingle();
     if (t) timer = t;
 
     renderQueue();
     renderClock();
+    await checkAndNotifyUpcoming();
   }
 
   function setupRealtime() {
     sb.channel('callsheet_sync')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'queue' }, async () => {
         const { data } = await sb.from('queue').select('*').order('position', { ascending: true });
-        if (data) { queue = data; renderQueue(); }
+        if (data) { 
+          queue = data; 
+          renderQueue(); 
+          await checkAndNotifyUpcoming();
+        }
       })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'timer_state' }, (payload) => {
         if (payload.new) {
@@ -468,19 +517,44 @@
       .subscribe();
   }
 
-  // --- Controls ---
+  // --- Queue Handlers ---
+  async function handleAdvanceQueue() {
+    if (queue.length === 0) return;
+
+    const currentSpeaker = queue[0];
+    await sb.from('queue').delete().eq('id', currentSpeaker.id);
+
+    await sb.from('timer_state').update({
+      running: false,
+      remaining_seconds: timer.duration_seconds || 180,
+      ends_at: null,
+      updated_at: new Date().toISOString()
+    }).eq('id', 1);
+
+    await loadInitialData();
+  }
+
   playPauseBtn.addEventListener('click', async () => {
     if (queue.length === 0) return;
-    const isRunning = !timer.running;
+
+    const isStarting = !timer.running;
+    let remainingSec = timer.remaining_seconds;
     let endsAt = null;
 
-    if (isRunning) {
-      const remaining = timer.remaining_seconds > 0 ? timer.remaining_seconds : timer.duration_seconds;
-      endsAt = new Date(Date.now() + remaining * 1000).toISOString();
+    if (isStarting) {
+      const currentRemaining = (remainingSec && remainingSec > 0) ? remainingSec : (timer.duration_seconds || 180);
+      endsAt = new Date(Date.now() + currentRemaining * 1000).toISOString();
+    } else {
+      if (timer.ends_at) {
+        const diff = Math.round((new Date(timer.ends_at).getTime() - Date.now()) / 1000);
+        remainingSec = Math.max(0, diff);
+      }
+      endsAt = null;
     }
 
     await sb.from('timer_state').update({
-      running: isRunning,
+      running: isStarting,
+      remaining_seconds: remainingSec,
       ends_at: endsAt,
       updated_at: new Date().toISOString()
     }).eq('id', 1);
@@ -489,15 +563,13 @@
   resetBtn.addEventListener('click', async () => {
     await sb.from('timer_state').update({
       running: false,
-      remaining_seconds: timer.duration_seconds,
+      remaining_seconds: timer.duration_seconds || 180,
       ends_at: null,
       updated_at: new Date().toISOString()
     }).eq('id', 1);
   });
 
-  nextBtn.addEventListener('click', async () => {
-    await sb.rpc('advance_queue');
-  });
+  nextBtn.addEventListener('click', handleAdvanceQueue);
 
   window.moveQueue = async function(index, direction) {
     const target = index + direction;
@@ -505,51 +577,101 @@
     const a = queue[index];
     const b = queue[target];
 
-    await sb.from('queue').upsert([
-      { id: a.id, position: b.position },
-      { id: b.id, position: a.position }
-    ]);
+    // Reset notification trackers on position swap
+    await sb.from('queue').update({ position: b.position, last_notified_position: 0, notified: false }).eq('id', a.id);
+    await sb.from('queue').update({ position: a.position, last_notified_position: 0, notified: false }).eq('id', b.id);
+    
+    await loadInitialData();
   };
 
   window.removeQueue = async function(id) {
     await sb.from('queue').delete().eq('id', id);
+    await loadInitialData();
   };
 
   addForm.addEventListener('submit', async (e) => {
     e.preventDefault();
-    const name = document.getElementById('in-name').value.trim();
-    const email = document.getElementById('in-email').value.trim() || null;
-    const nextPos = queue.length > 0 ? Math.max(...queue.map(q => q.position)) + 1 : 1;
+    const nameInput = document.getElementById('in-name');
+    const emailInput = document.getElementById('in-email');
+    
+    const name = nameInput.value.trim();
+    const email = emailInput.value.trim() || null;
+    if (!name) return;
 
-    await sb.from('queue').insert({ name, notify_email: email, position: nextPos });
-    addForm.reset();
+    const nextPos = queue.length > 0 ? Math.max(...queue.map(q => q.position || 0)) + 1 : 1;
+
+    const { error } = await sb
+      .from('queue')
+      .insert([{ name, notify_email: email, position: nextPos, notified: false }]);
+
+    if (error) {
+      alert("Error adding presenter: " + error.message);
+      return;
+    }
+
+    nameInput.value = '';
+    emailInput.value = '';
+
+    await loadInitialData();
   });
 
-  // --- Auth ---
+  // --- Auth & Roles ---
   authBtn.addEventListener('click', async () => {
     if (currentUser) {
       await sb.auth.signOut();
       setAuth(null);
     } else {
-      const email = prompt("Admin Email:");
-      const password = prompt("Admin Password:");
-      if (!email || !password) return;
-      const { data, error } = await sb.auth.signInWithPassword({ email, password });
-      if (error) alert(error.message);
-      else setAuth(data.user);
+      const { error } = await sb.auth.signInWithOAuth({
+        provider: 'google',
+        options: {
+          redirectTo: window.location.origin
+        }
+      });
+      if (error) alert("Login Error: " + error.message);
     }
   });
 
-  function setAuth(user) {
+  async function setAuth(user) {
     currentUser = user;
-    document.body.classList.toggle('admin-mode', !!user);
-    authBtn.textContent = user ? 'Logout' : 'Admin Login';
-    authBtn.classList.toggle('active', !!user);
+    let isAdmin = false;
+
+    if (user) {
+      const { data: role, error } = await sb.rpc('get_my_role');
+      if (!error && role === 'admin') {
+        isAdmin = true;
+      } else {
+        const { data: fallbackData } = await sb
+          .from('user_roles')
+          .select('role')
+          .eq('user_id', user.id)
+          .maybeSingle();
+        if (fallbackData?.role === 'admin') isAdmin = true;
+      }
+    }
+
+    document.body.classList.toggle('admin-mode', isAdmin);
+
+    if (user) {
+      authBtn.textContent = `Logout [${isAdmin ? 'Admin' : 'Viewer'}]`;
+      authBtn.classList.toggle('active', isAdmin);
+    } else {
+      authBtn.textContent = 'Login';
+      authBtn.classList.remove('active');
+    }
+
     renderQueue();
   }
 
+  // --- Auth & Timer Intervals ---
+  sb.auth.onAuthStateChange(async (_event, session) => {
+    await setAuth(session?.user || null);
+  });
+
+  sb.auth.getUser().then(async ({ data }) => {
+    await setAuth(data.user);
+  });
+
   setInterval(renderClock, 500);
-  sb.auth.getUser().then(({ data }) => setAuth(data.user));
   loadInitialData();
   setupRealtime();
 </script>
